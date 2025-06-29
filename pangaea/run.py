@@ -59,6 +59,68 @@ def get_exp_info(hydra_config: HydraConf) -> dict[str, str]:
     return exp_info
 
 
+def get_device_and_distributed_setup():
+    """Get device and distributed training setup based on environment.
+    
+    Returns:
+        tuple: (device, rank, local_rank, world_size, is_distributed)
+    """
+    # Check if we're in a distributed training environment
+    is_distributed = "RANK" in os.environ and "LOCAL_RANK" in os.environ
+    
+    if is_distributed:
+        # Distributed training setup
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        
+        # Determine the appropriate backend and device
+        if torch.backends.mps.is_available():
+            # On Mac with MPS, we can't use distributed training effectively
+            # Fall back to single device mode
+            print("Warning: MPS detected with distributed environment variables. "
+                  "Falling back to single-device MPS training.")
+            is_distributed = False
+            rank = 0
+            local_rank = 0
+            world_size = 1
+            device = torch.device("mps")
+        elif torch.cuda.is_available():
+            # Use CUDA with NCCL backend
+            try:
+                torch.distributed.init_process_group(backend="nccl")
+                device = torch.device("cuda", local_rank)
+                torch.cuda.set_device(device)
+            except RuntimeError as e:
+                if "NCCL" in str(e):
+                    # NCCL not available, try gloo backend
+                    print("Warning: NCCL not available, falling back to gloo backend")
+                    torch.distributed.init_process_group(backend="gloo")
+                    device = torch.device("cuda", local_rank)
+                    torch.cuda.set_device(device)
+                else:
+                    raise e
+        else:
+            # CPU-only distributed training with gloo
+            torch.distributed.init_process_group(backend="gloo")
+            device = torch.device("cpu")
+    else:
+        # Single device setup
+        rank = 0
+        local_rank = 0 
+        world_size = 1
+        
+        # Device selection priority: MPS > CUDA > CPU
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+        elif torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+    
+    return device, rank, local_rank, world_size, is_distributed
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="train")
 def main(cfg: DictConfig) -> None:
     """Geofm-bench main function.
@@ -68,13 +130,9 @@ def main(cfg: DictConfig) -> None:
     """
     # fix all random seeds
     fix_seed(cfg.seed)
-    # distributed training variables
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    device = torch.device("cuda", local_rank)
-
-    torch.cuda.set_device(device)
-    torch.distributed.init_process_group(backend="nccl")
+    
+    # Get device and distributed setup
+    device, rank, local_rank, world_size, is_distributed = get_device_and_distributed_setup()
 
     # true if training else false
     train_run = cfg.train
@@ -124,6 +182,9 @@ def main(cfg: DictConfig) -> None:
     logger.info(pprint.pformat(OmegaConf.to_container(cfg), compact=True).strip("{}"))
     logger.info("The experiment is stored in %s\n" % exp_dir)
     logger.info(f"Device used: {device}")
+    logger.info(f"Distributed training: {is_distributed}")
+    if is_distributed:
+        logger.info(f"World size: {world_size}, Rank: {rank}, Local rank: {local_rank}")
 
     encoder: Encoder = instantiate(cfg.encoder)
     encoder.load_encoder_weights(logger)
@@ -135,15 +196,24 @@ def main(cfg: DictConfig) -> None:
         encoder=encoder,
     )
     decoder.to(device)
-    decoder = torch.nn.parallel.DistributedDataParallel(
-        decoder,
-        device_ids=[local_rank],
-        output_device=local_rank,
-        find_unused_parameters=cfg.finetune,
-    )
+    
+    # Apply data parallel based on setup
+    if is_distributed:
+        decoder = torch.nn.parallel.DistributedDataParallel(
+            decoder,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=cfg.finetune,
+        )
+    elif torch.cuda.device_count() > 1 and device.type == "cuda":
+        # Multi-GPU single node training
+        decoder = torch.nn.DataParallel(decoder)
+    # For MPS or single GPU, no parallelization needed
+    
     logger.info(
         "Built {} for with {} encoder.".format(
-            decoder.module.model_name, type(encoder).__name__
+            decoder.module.model_name if hasattr(decoder, 'module') else decoder.model_name, 
+            type(encoder).__name__
         )
     )
 
@@ -207,10 +277,18 @@ def main(cfg: DictConfig) -> None:
         )
 
         # get train val data loaders
+        if is_distributed:
+            train_sampler = DistributedSampler(train_dataset)
+            val_sampler = DistributedSampler(val_dataset)
+        else:
+            train_sampler = None
+            val_sampler = None
+            
         train_loader = DataLoader(
             train_dataset,
-            sampler=DistributedSampler(train_dataset),
+            sampler=train_sampler,
             batch_size=cfg.batch_size,
+            shuffle=(train_sampler is None),  # Only shuffle if no sampler
             num_workers=cfg.num_workers,
             pin_memory=True,
             # persistent_workers=True causes memory leak
@@ -223,8 +301,9 @@ def main(cfg: DictConfig) -> None:
 
         val_loader = DataLoader(
             val_dataset,
-            sampler=DistributedSampler(val_dataset),
+            sampler=val_sampler,
             batch_size=cfg.test_batch_size,
+            shuffle=False,
             num_workers=cfg.test_num_workers,
             pin_memory=True,
             persistent_workers=False,
@@ -275,10 +354,16 @@ def main(cfg: DictConfig) -> None:
     raw_test_dataset: RawGeoFMDataset = instantiate(cfg.dataset, split="test")
     test_dataset = GeoFMDataset(raw_test_dataset, test_preprocessor)
 
+    if is_distributed:
+        test_sampler = DistributedSampler(test_dataset)
+    else:
+        test_sampler = None
+
     test_loader = DataLoader(
         test_dataset,
-        sampler=DistributedSampler(test_dataset),
+        sampler=test_sampler,
         batch_size=cfg.test_batch_size,
+        shuffle=False,
         num_workers=cfg.test_num_workers,
         pin_memory=True,
         persistent_workers=False,

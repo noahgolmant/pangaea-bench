@@ -50,7 +50,7 @@ def download_bucket_concurrently(bucket_name, destination_directory=""):
     bucket = storage_client.bucket(bucket_name)
 
     blobs = list(bucket.list_blobs())
-    print(f"Downloading {len(blobs)} files from GSC...")
+    print(f"Downloading {len(blobs)} files from GCS...")
 
     blob_file_pairs = []
 
