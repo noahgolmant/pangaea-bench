@@ -51,8 +51,11 @@ class Evaluator:
             inference_mode: str = 'sliding',
             sliding_inference_batch: int = None,
             use_wandb: bool = False,
+            rank: int = 0,
+            is_distributed: bool = False,
     ) -> None:
-        self.rank = int(os.environ["RANK"])
+        self.rank = rank
+        self.is_distributed = is_distributed
         self.val_loader = val_loader
         self.logger = logging.getLogger()
         self.exp_dir = exp_dir
@@ -71,6 +74,10 @@ class Evaluator:
             i for i in range(self.num_classes) if i != self.ignore_index
         ]
         self.valid_classes = [self.classes[i] for i in self.valid_class_indices]
+
+    def _get_model(self, model):
+        """Get the actual model (unwrapped from DataParallel if needed)."""
+        return model.module if hasattr(model, 'module') else model
 
     def evaluate(
             self,
@@ -148,8 +155,10 @@ class LinearClassificationEvaluator(Evaluator):
         use_wandb: bool = False,
         multi_label: bool = False,   # Flag to indicate multi-label evaluation
         topk: int = 1,               # For multi-label: if > 1, use top-k selection
+        rank: int = 0,
+        is_distributed: bool = False,
     ) -> None:
-        super().__init__(val_loader, exp_dir, device, inference_mode, sliding_inference_batch, use_wandb)
+        super().__init__(val_loader, exp_dir, device, inference_mode, sliding_inference_batch, use_wandb, rank=rank, is_distributed=is_distributed)
         self.multi_label = multi_label
         self.topk = topk
         
@@ -164,9 +173,9 @@ class LinearClassificationEvaluator(Evaluator):
             model_dict = torch.load(model_ckpt_path, map_location=self.device, weights_only=False)
             model_name = os.path.basename(model_ckpt_path).split(".")[0]
             if "model" in model_dict:
-                model.module.load_state_dict(model_dict["model"])
+                self._get_model(model).load_state_dict(model_dict["model"])
             else:
-                model.module.load_state_dict(model_dict)
+                self._get_model(model).load_state_dict(model_dict)
             self.logger.info(f"Loaded {model_name} for evaluation")
         
         model.eval()
@@ -239,7 +248,7 @@ class LinearClassificationEvaluator(Evaluator):
     def compute_metrics(self):
         pass
 
-    def log_metrics(self, metrics: dict):
+    def log_metrics(self, metrics):
         def format_metric(name, value):
             header = f"[{self.split}] ------- {name} --------\n"
             value_str = (
@@ -278,8 +287,10 @@ class KNNClassificationEvaluator(Evaluator):
         sliding_inference_batch: int = None,
         use_wandb: bool = False,
         multi_label: bool = False,
+        rank: int = 0,
+        is_distributed: bool = False,
     ) -> None:
-        super().__init__(val_loader, exp_dir, device, use_wandb)
+        super().__init__(val_loader, exp_dir, device, inference_mode, sliding_inference_batch, use_wandb, rank=rank, is_distributed=is_distributed)
         self.multi_label = multi_label
         self.logger = logging.getLogger()
         # e.g., self.split is set by base Evaluator to "val" or "test"
@@ -309,7 +320,7 @@ class KNNClassificationEvaluator(Evaluator):
             ckpt = torch.load(model_ckpt_path, map_location=self.device, weights_only=False)
             model_name = os.path.basename(model_ckpt_path).split(".")[0]
             state = ckpt.get("model", ckpt)
-            model.module.load_state_dict(state)
+            self._get_model(model).load_state_dict(state)
             self.logger.info(f"Loaded {model_name} for evaluation")
 
         model.eval()
@@ -408,8 +419,10 @@ class SegEvaluator(Evaluator):
             inference_mode: str = 'sliding',
             sliding_inference_batch: int = None,
             use_wandb: bool = False,
+            rank: int = 0,
+            is_distributed: bool = False,
     ):
-        super().__init__(val_loader, exp_dir, device, inference_mode, sliding_inference_batch, use_wandb)
+        super().__init__(val_loader, exp_dir, device, inference_mode, sliding_inference_batch, use_wandb, rank=rank, is_distributed=is_distributed)
 
     @torch.no_grad()
     def evaluate(self, model, model_name='model', model_ckpt_path=None):
@@ -419,9 +432,9 @@ class SegEvaluator(Evaluator):
             model_dict = torch.load(model_ckpt_path, map_location=self.device, weights_only=False)
             model_name = os.path.basename(model_ckpt_path).split(".")[0]
             if "model" in model_dict:
-                model.module.load_state_dict(model_dict["model"])
+                self._get_model(model).load_state_dict(model_dict["model"])
             else:
-                model.module.load_state_dict(model_dict)
+                self._get_model(model).load_state_dict(model_dict)
 
             self.logger.info(f"Loaded {model_name} for evaluation")
         model.eval()
@@ -438,7 +451,7 @@ class SegEvaluator(Evaluator):
             target = target.to(self.device)
 
             if self.inference_mode == "sliding":
-                input_size = model.module.encoder.input_size
+                input_size = self._get_model(model).encoder.input_size
                 logits = self.sliding_inference(model, image, input_size, output_shape=target.shape[-2:],
                                                 max_batch=self.sliding_inference_batch)
             elif self.inference_mode == "whole":
@@ -456,9 +469,11 @@ class SegEvaluator(Evaluator):
             )
             confusion_matrix += count.view(self.num_classes, self.num_classes)
 
-        torch.distributed.all_reduce(
-            confusion_matrix, op=torch.distributed.ReduceOp.SUM
-        )
+        # Only do all_reduce if in distributed mode
+        if self.is_distributed:
+            torch.distributed.all_reduce(
+                confusion_matrix, op=torch.distributed.ReduceOp.SUM
+            )
         metrics = self.compute_metrics(confusion_matrix.cpu())
         self.log_metrics(metrics)
 
@@ -594,8 +609,10 @@ class RegEvaluator(Evaluator):
             inference_mode: str = 'sliding',
             sliding_inference_batch: int = None,
             use_wandb: bool = False,
+            rank: int = 0,
+            is_distributed: bool = False,
     ):
-        super().__init__(val_loader, exp_dir, device, inference_mode, sliding_inference_batch, use_wandb)
+        super().__init__(val_loader, exp_dir, device, inference_mode, sliding_inference_batch, use_wandb, rank=rank, is_distributed=is_distributed)
 
     @torch.no_grad()
     def evaluate(self, model, model_name='model', model_ckpt_path=None):
@@ -605,9 +622,9 @@ class RegEvaluator(Evaluator):
             model_dict = torch.load(model_ckpt_path, map_location=self.device, weights_only=False)
             model_name = os.path.basename(model_ckpt_path).split('.')[0]
             if 'model' in model_dict:
-                model.module.load_state_dict(model_dict["model"])
+                self._get_model(model).load_state_dict(model_dict["model"])
             else:
-                model.module.load_state_dict(model_dict)
+                self._get_model(model).load_state_dict(model_dict)
 
             self.logger.info(f"Loaded model from {model_ckpt_path} for evaluation")
 
@@ -623,7 +640,7 @@ class RegEvaluator(Evaluator):
             target = target.to(self.device)
 
             if self.inference_mode == "sliding":
-                input_size = model.module.encoder.input_size
+                input_size = self._get_model(model).encoder.input_size
                 logits = self.sliding_inference(model, image, input_size, output_shape=target.shape[-2:],
                                                 max_batch=self.sliding_inference_batch).squeeze(dim=1)
             elif self.inference_mode == "whole":
@@ -631,12 +648,15 @@ class RegEvaluator(Evaluator):
             else:
                 raise NotImplementedError((f"Inference mode {self.inference_mode} is not implemented."))
 
-            mse += F.mse_loss(logits, target)
+            mse += torch.nn.functional.mse_loss(logits, target, reduction='sum')
 
-        torch.distributed.all_reduce(mse, op=torch.distributed.ReduceOp.SUM)
-        mse = mse / len(self.val_loader)
+        # Only do all_reduce if in distributed mode
+        if self.is_distributed:
+            torch.distributed.all_reduce(mse, op=torch.distributed.ReduceOp.SUM)
 
-        metrics = {"MSE": mse.item(), "RMSE": torch.sqrt(mse).item()}
+        mse = (mse / len(self.val_loader.dataset)).item()
+
+        metrics = {"MSE": mse, "RMSE": torch.sqrt(mse)}
         self.log_metrics(metrics)
 
         used_time = time.time() - t

@@ -4,9 +4,14 @@ import torch
 import torch.nn.functional as F
 
 
-def get_collate_fn(modalities: list[str]) -> Callable:
-    def collate_fn(
-        batch: dict[str, dict[str, torch.Tensor] | torch.Tensor],
+class CollateFunction:
+    """Collate function class that can be pickled for multiprocessing."""
+    
+    def __init__(self, modalities: list[str]):
+        self.modalities = modalities
+    
+    def __call__(
+        self, batch: dict[str, dict[str, torch.Tensor] | torch.Tensor],
     ) -> dict[str, dict[str, torch.Tensor] | torch.Tensor]:
         """Collate function for torch DataLoader
         args:
@@ -19,13 +24,13 @@ def get_collate_fn(modalities: list[str]) -> Callable:
         """
         # compute the maximum temporal dimension
         T_max = 0
-        for modality in modalities:
+        for modality in self.modalities:
             for x in batch:
                 # check if the image is a time series, i.e. has 4 dimensions
                 if len(x["image"][modality].shape) == 4:
                     T_max = max(T_max, x["image"][modality].shape[1])
         # pad all images to the same temporal dimension
-        for modality in modalities:
+        for modality in self.modalities:
             for i, x in enumerate(batch):
                 # check if the image is a time series, if yes then pad it
                 # else do nothing
@@ -41,10 +46,20 @@ def get_collate_fn(modalities: list[str]) -> Callable:
         return {
             "image": {
                 modality: torch.stack([x["image"][modality] for x in batch])
-                for modality in modalities
+                for modality in self.modalities
             },
             "target": torch.stack([x["target"] for x in batch]),
             "metadata": [sample["metadata"] for sample in batch]
         }
 
-    return collate_fn
+
+def get_collate_fn(modalities: list[str]) -> Callable:
+    """Get a collate function that can be pickled for multiprocessing.
+    
+    Args:
+        modalities: List of modality names
+        
+    Returns:
+        CollateFunction instance that can be pickled
+    """
+    return CollateFunction(modalities)

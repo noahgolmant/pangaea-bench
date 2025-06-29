@@ -33,6 +33,8 @@ class Trainer:
         eval_interval: int,
         log_interval: int,
         best_metric_key: str,
+        rank: int = 0,
+        is_distributed: bool = False,
     ):
         """Initialize the Trainer.
 
@@ -52,8 +54,10 @@ class Trainer:
             eval_interval (int): interval to evaluate the model.
             log_interval (int): interval to log the training information.
             best_metric_key (str): metric that determines best checkpoints.
+            rank (int): rank of the process
+            is_distributed (bool): whether the process is distributed
         """
-        self.rank = int(os.environ["RANK"])
+        self.rank = rank
         self.criterion = criterion
         self.model = model
         self.train_loader = train_loader
@@ -70,6 +74,7 @@ class Trainer:
         self.eval_interval = eval_interval
         self.log_interval = log_interval
         self.best_metric_key = best_metric_key
+        self.is_distributed = is_distributed
 
         self.training_stats = {
             name: RunningAverageMeter(length=self.batch_per_epoch)
@@ -86,8 +91,14 @@ class Trainer:
         ], f"Invalid precision {precision}, use 'fp32', 'fp16' or 'bfp16'."
         self.enable_mixed_precision = precision != "fp32"
         self.precision = torch.float16 if (precision == "fp16") else torch.bfloat16
-        # self.scaler = torch.GradScaler("cuda", enabled=self.enable_mixed_precision)
-        self.scaler = torch.cuda.amp.GradScaler("cuda", enabled=self.enable_mixed_precision)
+        
+        # Use device-agnostic GradScaler
+        if self.device.type == "cuda":
+            self.scaler = torch.amp.GradScaler("cuda", enabled=self.enable_mixed_precision)
+        else:
+            # For MPS and CPU, disable mixed precision as it's not fully supported
+            self.enable_mixed_precision = False
+            self.scaler = torch.amp.GradScaler("cpu", enabled=False)
 
         self.start_epoch = 0
 
@@ -109,7 +120,8 @@ class Trainer:
             self.logger.info("============ Starting epoch %i ... ============" % epoch)
             # set sampler
             self.t = time.time()
-            self.train_loader.sampler.set_epoch(epoch)
+            if hasattr(self.train_loader.sampler, 'set_epoch'):
+                self.train_loader.sampler.set_epoch(epoch)
             self.train_one_epoch(epoch)
             if epoch % self.ckpt_interval == 0 and epoch != self.start_epoch:
                 self.save_model(epoch)
@@ -137,8 +149,10 @@ class Trainer:
 
             self.training_stats["data_time"].update(time.time() - end_time)
 
+            # Use device-appropriate autocast
+            device_type = "cuda" if self.device.type == "cuda" else "cpu"
             with torch.autocast(
-                "cuda", enabled=self.enable_mixed_precision, dtype=self.precision
+                device_type, enabled=self.enable_mixed_precision, dtype=self.precision
             ):
                 logits = self.model(image, output_shape=target.shape[-2:])
                 loss = self.compute_loss(logits, target)
@@ -178,6 +192,10 @@ class Trainer:
             self.training_stats["batch_time"].update(time.time() - end_time)
             end_time = time.time()
 
+    def _get_model(self, model):
+        """Get the actual model (unwrapped from DataParallel if needed)."""
+        return model.module if hasattr(model, 'module') else model
+
     def get_checkpoint(self, epoch: int) -> dict[str, dict | int]:
         """Create a checkpoint dictionary, containing references to the pytorch tensors.
 
@@ -188,7 +206,7 @@ class Trainer:
             dict[str, dict | int]: checkpoint dictionary.
         """
         checkpoint = {
-            "model": self.model.module.state_dict(),
+            "model": self._get_model(self.model).state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "lr_scheduler": self.lr_scheduler.state_dict(),
             "scaler": self.scaler.state_dict(),
@@ -212,7 +230,8 @@ class Trainer:
             checkpoint (dict[str, dict  |  int] | None, optional): already prepared checkpoint dict. Defaults to None.
         """
         if self.rank != 0:
-            torch.distributed.barrier()
+            if self.is_distributed:
+                torch.distributed.barrier()
             return
         checkpoint = self.get_checkpoint(epoch) if checkpoint is None else checkpoint
         suffix = "_best" if is_best else f"{epoch}_final" if is_final else f"{epoch}"
@@ -221,7 +240,8 @@ class Trainer:
         self.logger.info(
             f"Epoch {epoch} | Training checkpoint saved at {checkpoint_path}"
         )
-        torch.distributed.barrier()
+        if self.is_distributed:
+            torch.distributed.barrier()
         return
 
     def load_model(self, resume_path: str | pathlib.Path) -> None:
@@ -232,13 +252,13 @@ class Trainer:
         """
         model_dict = torch.load(resume_path, map_location=self.device, weights_only=False)
         if "model" in model_dict:
-            self.model.module.load_state_dict(model_dict["model"])
+            self._get_model(self.model).load_state_dict(model_dict["model"])
             self.optimizer.load_state_dict(model_dict["optimizer"])
             self.lr_scheduler.load_state_dict(model_dict["lr_scheduler"])
             self.scaler.load_state_dict(model_dict["scaler"])
             self.start_epoch = model_dict["epoch"] + 1
         else:
-            self.model.module.load_state_dict(model_dict)
+            self._get_model(self.model).load_state_dict(model_dict)
             self.start_epoch = 0
 
         self.logger.info(
@@ -374,6 +394,8 @@ class LinearClassificationTrainer(Trainer):
         best_metric_key: str,
         multi_label: bool = False,  # <-- Flag for multi-label classification, e.g., BigEarthNet dataset
         topk: int = 1,  # Top-k predictions to use in multi-label scenario
+        rank: int = 0,
+        is_distributed: bool = False,
     ):
         """Initialize the Trainer for Classification task.
 
@@ -394,6 +416,8 @@ class LinearClassificationTrainer(Trainer):
             log_interval (int): interval to log the training information.
             best_metric_key (str): metric that determines best checkpoints.
             multi_label (bool): Flag to enable multi-label classification.
+            rank (int): rank of the process
+            is_distributed (bool): whether the process is distributed
         """
         super().__init__(
             model=model,
@@ -411,6 +435,8 @@ class LinearClassificationTrainer(Trainer):
             eval_interval=eval_interval,
             log_interval=log_interval,
             best_metric_key=best_metric_key,
+            rank=rank,
+            is_distributed=is_distributed,
         )
         
         self.multi_label = multi_label
@@ -492,6 +518,8 @@ class KNNTrainer(Trainer):
         n_epochs: int,
         precision: str,
         use_wandb: bool,
+        rank: int = 0,
+        is_distributed: bool = False,
     ):
         dummy_opt   = torch.optim.SGD([torch.empty(0, device=device, requires_grad=True)], lr=1)
         dummy_sched = torch.optim.lr_scheduler.LambdaLR(dummy_opt, lambda _: 1)
@@ -512,6 +540,8 @@ class KNNTrainer(Trainer):
             eval_interval=1,
             log_interval=999,
             best_metric_key="top1",
+            rank=rank,
+            is_distributed=is_distributed,
         )
         self.logger: logging.Logger = logging.getLogger()
         self.train_loader = train_loader
@@ -550,6 +580,8 @@ class SegTrainer(Trainer):
         eval_interval: int,
         log_interval: int,
         best_metric_key: str,
+        rank: int = 0,
+        is_distributed: bool = False,
     ):
         """Initialize the Trainer for segmentation task.
         Args:
@@ -568,6 +600,8 @@ class SegTrainer(Trainer):
             eval_interval (int): interval to evaluate the model.
             log_interval (int): interval to log the training information.
             best_metric_key (str): metric that determines best checkpoints.
+            rank (int): rank of the process
+            is_distributed (bool): whether the process is distributed
         """
         super().__init__(
             model=model,
@@ -585,6 +619,8 @@ class SegTrainer(Trainer):
             eval_interval=eval_interval,
             log_interval=log_interval,
             best_metric_key=best_metric_key,
+            rank=rank,
+            is_distributed=is_distributed,
         )
 
         self.training_metrics = {
@@ -676,6 +712,8 @@ class RegTrainer(Trainer):
         eval_interval: int,
         log_interval: int,
         best_metric_key: str,
+        rank: int = 0,
+        is_distributed: bool = False,
     ):
         """Initialize the Trainer for regression task.
         Args:
@@ -694,6 +732,8 @@ class RegTrainer(Trainer):
             eval_interval (int): interval to evaluate the model.
             log_interval (int): interval to log the training information.
             best_metric_key (str): metric that determines best checkpoints.
+            rank (int): rank of the process
+            is_distributed (bool): whether the process is distributed
         """
         super().__init__(
             model=model,
@@ -711,6 +751,8 @@ class RegTrainer(Trainer):
             eval_interval=eval_interval,
             log_interval=log_interval,
             best_metric_key=best_metric_key,
+            rank=rank,
+            is_distributed=is_distributed,
         )
 
         self.training_metrics = {

@@ -283,14 +283,20 @@ def main(cfg: DictConfig) -> None:
         else:
             train_sampler = None
             val_sampler = None
+        
+        # Pin memory is not supported on MPS
+        use_pin_memory = device.type != "mps"
+        # Multiprocessing can cause issues on MPS, so disable workers
+        num_workers = 0 if device.type == "mps" else cfg.num_workers
+        test_num_workers = 0 if device.type == "mps" else cfg.test_num_workers
             
         train_loader = DataLoader(
             train_dataset,
             sampler=train_sampler,
             batch_size=cfg.batch_size,
             shuffle=(train_sampler is None),  # Only shuffle if no sampler
-            num_workers=cfg.num_workers,
-            pin_memory=True,
+            num_workers=num_workers,
+            pin_memory=use_pin_memory,
             # persistent_workers=True causes memory leak
             persistent_workers=False,
             worker_init_fn=seed_worker,
@@ -304,8 +310,8 @@ def main(cfg: DictConfig) -> None:
             sampler=val_sampler,
             batch_size=cfg.test_batch_size,
             shuffle=False,
-            num_workers=cfg.test_num_workers,
-            pin_memory=True,
+            num_workers=test_num_workers,
+            pin_memory=use_pin_memory,
             persistent_workers=False,
             worker_init_fn=seed_worker,
             # generator=g,
@@ -322,7 +328,7 @@ def main(cfg: DictConfig) -> None:
         )
 
         val_evaluator: Evaluator = instantiate(
-            cfg.task.evaluator, val_loader=val_loader, exp_dir=exp_dir, device=device
+            cfg.task.evaluator, val_loader=val_loader, exp_dir=exp_dir, device=device, rank=rank, is_distributed=is_distributed
         )
         trainer: Trainer = instantiate(
             cfg.task.trainer,
@@ -334,6 +340,8 @@ def main(cfg: DictConfig) -> None:
             evaluator=val_evaluator,
             exp_dir=exp_dir,
             device=device,
+            rank=rank,
+            is_distributed=is_distributed,
         )
         # resume training if model_checkpoint is provided
         if cfg.ckpt_dir is not None:
@@ -359,19 +367,24 @@ def main(cfg: DictConfig) -> None:
     else:
         test_sampler = None
 
+    # Pin memory is not supported on MPS
+    use_pin_memory = device.type != "mps"
+    # Multiprocessing can cause issues on MPS, so disable workers
+    test_num_workers = 0 if device.type == "mps" else cfg.test_num_workers
+
     test_loader = DataLoader(
         test_dataset,
         sampler=test_sampler,
         batch_size=cfg.test_batch_size,
         shuffle=False,
-        num_workers=cfg.test_num_workers,
-        pin_memory=True,
+        num_workers=test_num_workers,
+        pin_memory=use_pin_memory,
         persistent_workers=False,
         drop_last=False,
         collate_fn=collate_fn,
     )
     test_evaluator: Evaluator = instantiate(
-        cfg.task.evaluator, val_loader=test_loader, exp_dir=exp_dir, device=device
+        cfg.task.evaluator, val_loader=test_loader, exp_dir=exp_dir, device=device, rank=rank, is_distributed=is_distributed
     )
 
     if cfg.use_final_ckpt:
